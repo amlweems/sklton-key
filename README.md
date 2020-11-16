@@ -20,27 +20,29 @@ go install github.com/amlweems/sklton-key
 ```
 $ sklton-key -h
 Usage of sklton-key:
-  -log string
-    	Log file to write key log to (defaults to stdout).
   -pid int
     	Pid to attach to.
-```
-
-Before starting your target, you'll need to start a packet capture (e.g. tcpdump):
-```
-$ tcpdump -s0 -w capture.pcap
+  -cmd string
+    	Command to launch and attach to.
+  -log string
+    	Log file to write key log to (default "skl.log")
+  -tcpdump
+    	If true, capture packets and save pcap to a file
+  -dev string
+    	Device to capture packets on (default "eth0")
+  -pcap string
+    	Path to write pcap to (default "skl.pcap")
 ```
 
 You may now start your target process and launch `sklton-key` to begin writing
 the key log:
 ```
-$ ./target-binary &
-$ sklton-key -pid `pidof target-binary` -log keys.log
+$ sklton-key -cmd ./target-binary -tcpdump -dev en0
 ```
 
 Once the binary begins making requests, you can use Wireshark to decrypt the
 packet capture. Wireshark 1.6.0 and above can use these log files to decrypt
-packets. Set the following Wireshark setting to your `keys.log` file.
+packets. Set the following Wireshark setting to your `skl.log` file.
 
 Edit→Preferences→Protocols→TLS→(Pre)-Master-Secret log filename
 

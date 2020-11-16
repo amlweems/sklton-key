@@ -26,6 +26,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/go-delve/delve/service/debugger"
 	"github.com/go-delve/delve/service/rpc2"
 	"github.com/go-delve/delve/service/rpccommon"
+	"github.com/google/shlex"
 )
 
 // Check if an error is an BreakpointExistsError error
@@ -80,19 +82,36 @@ func writeKeyLog(w io.Writer, args []api.Variable) {
 }
 
 var (
-	flagAttachPid   int
-	flagLogFilename string
+	flagAttachPid int
+	flagExecCmd   string
+
+	flagTcpdump    bool
+	flagDeviceName string
+
+	flagLogFilename  string
+	flagPcapFilename string
 )
 
 func main() {
+	// debugger flags
 	flag.IntVar(&flagAttachPid, "pid", 0, "Pid to attach to.")
-	flag.StringVar(&flagLogFilename, "log", "", "Log file to write key log to (defaults to stdout).")
+	flag.StringVar(&flagExecCmd, "cmd", "", "Command to launch and attach to.")
+
+	// packet capture flags
+	flag.BoolVar(&flagTcpdump, "tcpdump", false, "If true, capture packets and save pcap to a file")
+	flag.StringVar(&flagDeviceName, "dev", "eth0", "Device to capture packets on")
+
+	// output flags
+	flag.StringVar(&flagPcapFilename, "pcap", "skl.pcap", "Path to write pcap to")
+	flag.StringVar(&flagLogFilename, "log", "skl.log", "Log file to write key log to")
+
 	flag.Parse()
 
 	// Set up log file io.Writer
 	var err error
 	var w io.WriteCloser
-	if flagLogFilename != "" {
+	if flagLogFilename != "" && flagLogFilename != "-" {
+		log.Printf("writing secrets to %s", flagLogFilename)
 		w, err = os.OpenFile(flagLogFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
 		if err != nil {
 			log.Fatal(err)
@@ -102,16 +121,34 @@ func main() {
 	}
 	defer w.Close()
 
+	// Capture packet trace and save to file
+	if flagTcpdump {
+		go PacketCapture(flagPcapFilename, flagDeviceName)
+	}
+
 	// Make a local in-memory connection that client and server use to communicate
 	listener, clientConn := service.ListenerPipe()
 	defer listener.Close()
+
+	pid := flagAttachPid
+	if flagExecCmd != "" {
+		args, err := shlex.Split(flagExecCmd)
+		if err != nil {
+			log.Fatalf("error splitting cmd: %s", err)
+		}
+		cmd := exec.Command(args[0], args[1:]...)
+		if err := cmd.Start(); err != nil {
+			log.Fatal(err)
+		}
+		pid = cmd.Process.Pid
+	}
 
 	// Create and start a debug server
 	server := rpccommon.NewServer(&service.Config{
 		Listener:   listener,
 		APIVersion: 2,
 		Debugger: debugger.Config{
-			AttachPid:      flagAttachPid,
+			AttachPid:      pid,
 			Backend:        "default",
 			CheckGoVersion: true,
 		},

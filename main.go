@@ -137,6 +137,8 @@ func main() {
 			log.Fatalf("error splitting cmd: %s", err)
 		}
 		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
 			log.Fatal(err)
 		}

@@ -23,19 +23,23 @@ import (
 	"github.com/google/gopacket/pcapgo"
 )
 
+const (
+    SnapLen = 65536
+)
+
 func PacketCapture(filename, deviceName string) {
 	f, err := os.Create(filename)
 	if err != nil {
 		log.Fatalf("error creating pcap file: %s", err)
 	}
 	w := pcapgo.NewWriter(f)
-	w.WriteFileHeader(1024, layers.LinkTypeEthernet)
+	w.WriteFileHeader(SnapLen, layers.LinkTypeEthernet)
 	defer f.Close()
 
 	log.Printf("writing pcap to %s", filename)
 
 	// Open the device for capturing
-	handle, err := pcap.OpenLive(deviceName, 1024, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(deviceName, SnapLen, false, pcap.BlockForever)
 	if err != nil {
 		log.Fatalf("error opening device %s: %s", deviceName, err)
 	}

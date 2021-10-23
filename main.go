@@ -27,6 +27,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -45,7 +46,13 @@ func isBreakpointExistsErr(err error) bool {
 
 // varToBytes converts an api.Variable of type []byte to a []byte
 func varToBytes(v api.Variable) []byte {
-	out := make([]byte, v.Len)
+	var size int64
+	if v.Len < v.Cap {
+		size = v.Len
+	} else {
+		size = v.Cap
+	}
+	out := make([]byte, size)
 	for i := range out {
 		v, _ := strconv.Atoi(v.Children[i].Value)
 		out[i] = byte(v)
@@ -53,32 +60,129 @@ func varToBytes(v api.Variable) []byte {
 	return out
 }
 
+func lookup(v api.Variable, name string) api.Variable {
+	parts := strings.Split(name, ".")
+	for _, part := range parts {
+		if v.Kind == reflect.Ptr && len(v.Children) == 1 {
+			v = v.Children[0]
+		}
+		var found bool
+		for _, child := range v.Children {
+			if child.Name == part {
+				v = child
+				found = true
+			}
+		}
+		if !found {
+			log.Printf("failed to find child %s", name)
+			return api.Variable{}
+		}
+	}
+	return v
+}
+
+type keyLogWriter struct {
+	w io.Writer
+}
+
+func NewKeyLogWriter(w io.Writer) *keyLogWriter {
+	return &keyLogWriter{
+		w: w,
+	}
+}
+
+const (
+	keyLogLabelTLS12           = "CLIENT_RANDOM"
+	keyLogLabelClientHandshake = "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
+	keyLogLabelServerHandshake = "SERVER_HANDSHAKE_TRAFFIC_SECRET"
+	keyLogLabelClientTraffic   = "CLIENT_TRAFFIC_SECRET_0"
+	keyLogLabelServerTraffic   = "SERVER_TRAFFIC_SECRET_0"
+)
+
 // SSL added and removed here ;-)
 // Handle two possible type signatures:
 //  func (c *Config) writeKeyLog(clientRandom, masterSecret []byte) error
 //  func (c *Config) writeKeyLog(label string, clientRandom, secret []byte) error
-func writeKeyLog(w io.Writer, args []api.Variable) {
-	var label string
-	var clientRandom, secret []byte
+func (klw *keyLogWriter) WriteKeyLog(stack []api.Stackframe, args []api.Variable) {
+	var clientRandom, secret, serverSecret, clientSecret []byte
 
-	// In delve v1.5.0, the end of the args array contains the return type and
-	// the receiver if present. The writeKeyLog method has a receiver and returns
-	// a single value, therefore, the argument array length is len+2.
-	if len(args) == 4 {
-		label = "CLIENT_RANDOM"
-	} else if len(args) == 5 {
-		label, args = args[0].Value, args[1:]
-	} else {
-		log.Fatalf("unknown type signature with %d args", len(args))
+	if len(stack) < 2 {
+		log.Printf("unknown stack with %d entries", len(stack))
+		return
+	}
+	if len(args) < 1 {
+		log.Printf("unknown type signature with %d args", len(args))
+		return
 	}
 
-	clientRandom = varToBytes(args[0])
-	args = args[1:]
+	frame := stack[1]
+	fname := frame.Location.Function.Name()
 
-	secret = varToBytes(args[0])
-	args = args[1:]
+	rcvr := args[0]
+	switch rcvr.Type {
+	case "*crypto/tls.clientHandshakeState":
+		switch fname {
+		case "crypto/tls.(*clientHandshakeState).doFullHandshake":
+			clientRandom = varToBytes(lookup(rcvr, "hello.random"))
+			secret = varToBytes(lookup(rcvr, "masterSecret"))
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelTLS12, clientRandom, secret)
+		default:
+			log.Printf("unknown function %s", fname)
+			return
+		}
 
-	fmt.Fprintf(w, "%s %x %x\n", label, clientRandom, secret)
+	case "*crypto/tls.serverHandshakeState":
+		switch fname {
+		case "crypto/tls.(*serverHandshakeState).doFullHandshake":
+			clientRandom = varToBytes(lookup(rcvr, "clientHello.random"))
+			secret = varToBytes(lookup(rcvr, "masterSecret"))
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelTLS12, clientRandom, secret)
+		default:
+			log.Printf("unknown function %s", fname)
+			return
+		}
+
+	case "*crypto/tls.clientHandshakeStateTLS13":
+		clientRandom = varToBytes(lookup(rcvr, "hello.random"))
+
+		switch fname {
+		case "crypto/tls.(*clientHandshakeStateTLS13).establishHandshakeKeys":
+			serverSecret = varToBytes(lookup(rcvr, "c.in.trafficSecret"))
+			clientSecret = varToBytes(lookup(rcvr, "c.out.trafficSecret"))
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelClientHandshake, clientRandom, clientSecret)
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelServerHandshake, clientRandom, serverSecret)
+		case "crypto/tls.(*clientHandshakeStateTLS13).readServerFinished":
+			serverSecret = varToBytes(lookup(rcvr, "c.in.trafficSecret"))
+			clientSecret = varToBytes(lookup(rcvr, "trafficSecret"))
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelClientTraffic, clientRandom, clientSecret)
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelServerTraffic, clientRandom, serverSecret)
+		default:
+			log.Printf("unknown function %s", fname)
+			return
+		}
+
+	case "*crypto/tls.serverHandshakeStateTLS13":
+		clientRandom = varToBytes(lookup(rcvr, "clientHello.random"))
+
+		switch fname {
+		case "crypto/tls.(*serverHandshakeStateTLS13).sendServerParameters":
+			serverSecret = varToBytes(lookup(rcvr, "c.out.trafficSecret"))
+			clientSecret = varToBytes(lookup(rcvr, "c.in.trafficSecret"))
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelClientHandshake, clientRandom, clientSecret)
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelServerHandshake, clientRandom, serverSecret)
+		case "crypto/tls.(*serverHandshakeStateTLS13).sendServerFinished":
+			serverSecret = varToBytes(lookup(rcvr, "c.out.trafficSecret"))
+			clientSecret = varToBytes(lookup(rcvr, "trafficSecret"))
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelClientTraffic, clientRandom, clientSecret)
+			fmt.Fprintf(klw.w, "%s %x %x\n", keyLogLabelServerTraffic, clientRandom, serverSecret)
+		default:
+			log.Printf("unknown function %s", fname)
+			return
+		}
+
+	default:
+		log.Printf("unknown type signature with '%s' receiver", rcvr.Type)
+	}
 }
 
 var (
@@ -109,17 +213,18 @@ func main() {
 
 	// Set up log file io.Writer
 	var err error
-	var w io.WriteCloser
+	var w io.Writer
 	if flagLogFilename != "" && flagLogFilename != "-" {
 		log.Printf("writing secrets to %s", flagLogFilename)
-		w, err = os.OpenFile(flagLogFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+		f, err := os.OpenFile(flagLogFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
 		if err != nil {
 			log.Fatal(err)
 		}
+		defer f.Close()
+		w = io.MultiWriter(f, os.Stdout)
 	} else {
 		w = os.Stdout
 	}
-	defer w.Close()
 
 	// Capture packet trace and save to file
 	if flagTcpdump {
@@ -165,7 +270,7 @@ func main() {
 
 	// Search for writeKeyLog function and set breakpoint
 	locs, err := client.FindLocation(api.EvalScope{GoroutineID: -1, Frame: 0},
-		"crypto/tls.(*Config).writeKeyLog", true)
+		"crypto/tls.(*Config).writeKeyLog", true, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -177,6 +282,8 @@ func main() {
 		log.Printf("hooked %s at %s:%d", locs[i].Function.Name(), locs[i].File, locs[i].Line)
 	}
 
+	klw := NewKeyLogWriter(w)
+
 	// Run the program, print key log on each breakpoint
 	for {
 		st := <-client.Continue()
@@ -184,17 +291,26 @@ func main() {
 			log.Printf("process exited with status %d", st.ExitStatus)
 			break
 		}
-		args, err := client.ListFunctionArgs(api.EvalScope{
-			GoroutineID: st.SelectedGoroutine.ID,
-			Frame:       0,
-		}, api.LoadConfig{
-			MaxStringLen:   256,
-			MaxArrayValues: 256,
-		})
+
+		stack, err := client.Stacktrace(st.SelectedGoroutine.ID, 1, api.StacktraceSimple, nil)
 		if err != nil {
-			log.Fatalf("error listing args: %s", err)
+			log.Fatalf("failed to fetch stacktrace: %s", err)
 		}
 
-		writeKeyLog(w, args)
+		args, err := client.ListFunctionArgs(api.EvalScope{
+			GoroutineID: st.SelectedGoroutine.ID,
+			Frame:       1,
+		}, api.LoadConfig{
+			FollowPointers:     true,
+			MaxStringLen:       256,
+			MaxArrayValues:     256,
+			MaxVariableRecurse: 4,
+			MaxStructFields:    -1,
+		})
+		if err != nil {
+			log.Fatalf("failed to list args: %s", err)
+		}
+
+		klw.WriteKeyLog(stack, args)
 	}
 }

@@ -30,6 +30,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
@@ -38,6 +39,29 @@ import (
 	"github.com/go-delve/delve/service/rpccommon"
 	"github.com/google/shlex"
 )
+
+// pidof searches /proc for a process matching name
+// search continues until process exists or timeout expires
+func pidof(name string) (int, error) {
+	log.Printf("searching for pidof %s", name)
+
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			return 0, fmt.Errorf("timeout")
+		default:
+			pid, err := PidOf(name)
+			if err != nil {
+				return 0, err
+			}
+			if pid > 0 {
+				return pid, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("unreachable")
+}
 
 // Check if an error is an BreakpointExistsError error
 func isBreakpointExistsErr(err error) bool {
@@ -186,8 +210,9 @@ func (klw *keyLogWriter) WriteKeyLog(stack []api.Stackframe, args []api.Variable
 }
 
 var (
-	flagAttachPid int
-	flagExecCmd   string
+	flagAttachPid  int
+	flagAttachName string
+	flagExecCmd    string
 
 	flagTcpdump    bool
 	flagDeviceName string
@@ -199,6 +224,7 @@ var (
 func main() {
 	// debugger flags
 	flag.IntVar(&flagAttachPid, "pid", 0, "Pid to attach to.")
+	flag.StringVar(&flagAttachName, "process", "", "Process name to attach to.")
 	flag.StringVar(&flagExecCmd, "cmd", "", "Command to launch and attach to.")
 
 	// packet capture flags
@@ -248,6 +274,11 @@ func main() {
 			log.Fatal(err)
 		}
 		pid = cmd.Process.Pid
+	} else if flagAttachName != "" {
+		pid, err = pidof(flagAttachName)
+		if err != nil {
+			log.Fatalf("failed to find pid: %s", err)
+		}
 	}
 
 	// Create and start a debug server
